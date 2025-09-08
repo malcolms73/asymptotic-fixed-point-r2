@@ -81,24 +81,116 @@ def get_aux(g, lam, tau):
 
 # ===========================================================
 # ===============   >>> MODEL REGION <<<   ==================
-# Paste your β-functions here (the ones you already had).
-# Keep signatures the same; the continuation/stability code
-# calls only the three functions below.
+# Drop-in, runnable β-functions with safe denominators.
+# You can use this as-is to test the pipeline. Later, replace
+# the marked sections with your true formulas, preserving
+# function names, arguments, and return shapes.
 #
-# Required functions:
-#   - beta_rhs_EH(g, lam): returns (β_x, β_λ) on the EH slice τ=0
-#   - beta_rhs_full(g, lam, tau, m2): returns (β_x, β_λ, β_τ)
-#   - eta_N_piece(g, lam, tau, m2) [optional diagnostic, can be stub]
+# Available helpers from outer scope:
+#   inv1(z, eps)  -> safe 1/z
+#   inv2(z, eps)  -> safe 1/z^2
+#   get_aux(g, lam, tau) -> (M, Delta) with
+#        M     = 1 - 2λ
+#        Delta = 32π g τ - M/3
+#   EPS_M, EPS_D  -> small regulators for M and Δ
 #
-# Notes:
-#   * x = ln g, so β_x = (∂_t g)/g = (β_g)/g
-#   * m2 is fixed (Option B) and passed in as a float
-#   * Use EPS_M and EPS_D in your denominators where you had them
-#   * You can use inv1(z, EPS_X) and inv2(z, EPS_X) above
-#
-# Below is a tiny placeholder that WILL NOT reproduce your physics.
-# Replace it with your actual formulas (from your working script).
+# Conventions:
+#   x = ln g  ⇒  β_x = (β_g / g)
+#   EH slice means τ=0
+#   m2 is fixed (Option B), can enter your kernels if needed
 # ===========================================================
+
+# ----- Tunable coefficients (keep small, stable defaults) -----
+_A0, _A1, _A2 = (-0.05, 0.10, 0.02)     # η_N EH: const, 1/M, 1/M^2
+_B0, _B1      = (-0.10, 0.20)           # β_λ EH: const, 1/M kernel (multiplied by g)
+
+# Full (τ-mixing) pieces:
+_C0, _C1, _C2 = (-0.05, 0.10, 0.02)     # η_N base: const, 1/M, 1/M^2
+_C3, _C4      = (0.003, 0.0)            # η_N τ-mix: (gτ)*1/M^2*1/Δ, and optional 1/Δ^2 term
+_D0, _D1      = (-0.10, 0.20)           # β_λ base kernel: const, 1/M
+_D2, _D3      = (0.010, 0.002)          # β_λ τ-mix: (gτ)*1/M^2*1/Δ, 1/M^2*1/Δ^2
+_E0, _E1      = (-0.010, 0.001)         # β_τ = E0*τ + E1*g*1/M^2*1/Δ
+
+def _etaN_EH(g, lam):
+    """
+    A numerically gentle η_N on the EH slice (τ=0).
+    Replace this with your true η_N(g,λ,τ=0) later if available.
+    """
+    M = 1.0 - 2.0*lam
+    invM  = inv1(M, EPS_M)
+    invM2 = inv2(M, EPS_M)
+    return g * (_A0 + _A1*invM + _A2*invM2)
+
+def _etaN_full(g, lam, tau, m2):
+    """
+    η_N with mild τ-mixing. Replace with your true expression when ready.
+    """
+    M, Delta = get_aux(g, lam, tau)
+    invM  = inv1(M,     EPS_M)
+    invM2 = inv2(M,     EPS_M)
+    invD  = inv1(Delta, EPS_D)
+    invD2 = inv2(Delta, EPS_D)
+    mix_tau = _C3*(g*tau)*invM2*invD + _C4*invD2
+    return g * (_C0 + _C1*invM + _C2*invM2 + mix_tau)
+
+def beta_rhs_EH(g, lam):
+    """
+    Einstein–Hilbert slice (τ=0).
+    Return (β_x, β_λ) with β_x = β_g/g.
+    """
+    etaN   = _etaN_EH(g, lam)
+    beta_x = 2.0 + etaN
+
+    # β_λ structure: canonical (-2+η_N)λ  +  g * kernel(λ)
+    M = 1.0 - 2.0*lam
+    invM = inv1(M, EPS_M)
+    kernel = _D0 + _D1*invM
+    beta_l = (-2.0 + etaN)*lam + g * kernel
+
+    # Safety clamps (prevent NaN propagation if user tweaks constants)
+    if not np.isfinite(beta_x): beta_x = 1e9
+    if not np.isfinite(beta_l): beta_l = 1e9
+    return float(beta_x), float(beta_l)
+
+def beta_rhs_full(g, lam, tau, m2):
+    """
+    Full EH + R^2(τ) system with fixed m^2 (Option B).
+    Return (β_x, β_λ, β_τ) with β_x = β_g/g.
+    """
+    etaN   = _etaN_full(g, lam, tau, m2)
+    beta_x = 2.0 + etaN
+
+    # β_λ = (-2+η_N)λ + g * [ base(M) + τ-mixing terms(Δ) ]
+    M, Delta = get_aux(g, lam, tau)
+    invM  = inv1(M,     EPS_M)
+    invM2 = inv2(M,     EPS_M)
+    invD  = inv1(Delta, EPS_D)
+    invD2 = inv2(Delta, EPS_D)
+
+    kernel_base = _D0 + _D1*invM
+    kernel_mix  = _D2*(g*tau)*invM2*invD + _D3*invM2*invD2
+    beta_l = (-2.0 + etaN)*lam + g * (kernel_base + kernel_mix)
+
+    # β_τ: gentle marginal behavior with weak driving from the graviton sector
+    beta_t = _E0*tau + _E1*g*invM2*invD
+
+    # Safety
+    bx, bl, bt = beta_x, beta_l, beta_t
+    if not np.isfinite(bx): bx = 1e9
+    if not np.isfinite(bl): bl = 1e9
+    if not np.isfinite(bt): bt = 1e9
+    return float(bx), float(bl), float(bt)
+
+def eta_N_piece(g, lam, tau, m2):
+    """
+    Diagnostic printer: mirrors η_N used inside beta_rhs_full.
+    """
+    return float(_etaN_full(g, lam, tau, m2))
+
+# ============= End of MODEL REGION (paste over) ============
+# ===========================================================
+
+
 
 def beta_rhs_EH(g, lam):
     """
