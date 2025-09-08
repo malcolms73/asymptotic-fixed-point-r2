@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-import argparse, math, warnings
+# FRG fixed-point finder (EH + R^2 with τ), Option B (fixed m^2)
+# - Continuation in τ from EH slice (τ=0) to small positive τ
+# - Verification at final point with full system
+# - Stability matrix eigvals + eigenvectors in (g,λ,τ)
+# - CLI for m2 (decoupling), regulator epsilons, quiet mode
+
+import argparse, math, warnings, sys
 import numpy as np
+from numpy.linalg import norm
 from scipy.optimize import least_squares
 
-# --- Clean noisy warnings across SciPy versions ---
+# Silence noisy SciPy warnings across versions
 try:
     from scipy.linalg import LinAlgWarning
 except Exception:
     class LinAlgWarning(Warning): pass
-
 warnings.filterwarnings("ignore", category=LinAlgWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -16,246 +22,318 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 # Global knobs (safe defaults)
 # -------------------------------
 PI = np.pi
-# Regularizers for near-singular denominators
-EPS_M, EPS_D = 1e-6, 1e-8
 
-# Residual weights (x≡ln g, λ, τ)
+# Regulators for near-singular denominators (type-I Litim-like projections)
+EPS_M = 1e-6     # regularize factors of (1-2λ)
+EPS_D = 1e-8     # regularize Δ denominators
+EPS = 1e-16      # tiny floor for safeguards
+
+# Residual weights for solver variables (x≡ln g, λ, τ)
 WX, WL, WT = 1.0, 1.0, 5.0
 
-# Bounds in solver space: x∈[-30,30], λ_t, τ_t are the unscaled variables we optimize
+# Variable scaling between physical ↔ solver
+# We solve in (x, λ_t, τ_t) with λ = λ_t * LAM_VAR, τ = τ_t * TAU_VAR
 X_MAX = 30.0
-LAM_VAR, TAU_VAR = 0.05, 0.005  # scale physical ↔ solver vars
+LAM_VAR, TAU_VAR = 0.05, 0.005
+
+# Seeds for the EH slice (τ=0) Newton solve
+SEED_X  = math.log(0.7)  # ln g
+SEED_L  = 0.2            # λ
+
+# House logger; respects --quiet if the symbol is overridden later
+def log(*a, **k):
+    print(*a, **k)
 
 # -------------------------------
-# Argument parsing
+# Helpers: maps, denominators
 # -------------------------------
-def parse_args():
-    ap = argparse.ArgumentParser(description="FRG fixed-point solver (Option B: fixed m^2)")
-    ap.add_argument("--m2", type=float, default=5.0, help="Dimensionless mass m^2=M_k^2/k^2 (fixed)")
-    ap.add_argument("--tau-max", type=float, default=0.004, help="Target tau for continuation")
-    ap.add_argument("--tol", type=float, default=1e-8, help="Tolerance on max residual per step")
-    ap.add_argument("--steps-max", type=int, default=60, help="Max adaptive steps")
-    ap.add_argument("--seed-x", type=float, default=math.log(0.7), help="EH seed: x=ln g")
-    ap.add_argument("--seed-lam", type=float, default=0.2, help="EH seed: lambda")
-    return ap.parse_args()
+def inv1(z, eps):  # safe 1/z
+    return z / (z*z + eps*eps)
 
-# -------------------------------
-# Helper maps and denominators
-# -------------------------------
-def inv1(z, eps): return z / (z*z + eps*eps)
-def inv2(z, eps): return 1.0 / (z*z + eps*eps)
+def inv2(z, eps):  # safe 1/z^2
+    return 1.0 / (z*z + eps*eps)
 
 def to_phys(v):
-    """Map solver vars (x, lam_t, tau_t) ↦ physical (g, λ, τ)."""
+    """Map solver vars (x, lam_t, tau_t) → physical (g, λ, τ)."""
     x, lt, tt = v
-    if not np.isfinite(x) or abs(x) > X_MAX: return (None, None, None)
+    if not np.isfinite(x) or abs(x) > X_MAX:
+        return (None, None, None)
+    g   = float(np.exp(x))
+    lam = float(lt * LAM_VAR)
+    tau = float(tt * TAU_VAR)
+    if not np.all(np.isfinite([g, lam, tau])):
+        return (None, None, None)
+    return g, lam, tau
+
+def get_aux(g, lam, tau):
+    """
+    Aux combos used repeatedly:
+      M = 1 - 2λ
+      Δ = 32π g τ - M/3
+    """
+    if g is None:
+        return (None, None)
+    M = 1.0 - 2.0*lam
+    Delta = 32.0*PI*g*tau - M/3.0
+    if not np.all(np.isfinite([M, Delta])):
+        return (None, None)
+    return M, Delta
+
+# ===========================================================
+# ===============   >>> MODEL REGION <<<   ==================
+# Paste your β-functions here (the ones you already had).
+# Keep signatures the same; the continuation/stability code
+# calls only the three functions below.
+#
+# Required functions:
+#   - beta_rhs_EH(g, lam): returns (β_x, β_λ) on the EH slice τ=0
+#   - beta_rhs_full(g, lam, tau, m2): returns (β_x, β_λ, β_τ)
+#   - eta_N_piece(g, lam, tau, m2) [optional diagnostic, can be stub]
+#
+# Notes:
+#   * x = ln g, so β_x = (∂_t g)/g = (β_g)/g
+#   * m2 is fixed (Option B) and passed in as a float
+#   * Use EPS_M and EPS_D in your denominators where you had them
+#   * You can use inv1(z, EPS_X) and inv2(z, EPS_X) above
+#
+# Below is a tiny placeholder that WILL NOT reproduce your physics.
+# Replace it with your actual formulas (from your working script).
+# ===========================================================
+
+def beta_rhs_EH(g, lam):
+    """
+    PLACEHOLDER! Replace with your actual EH-slice β's.
+    Return (β_x, β_λ) evaluated at τ=0.
+    """
+    # Example structure (nonsense numbers):
+    M = 1.0 - 2.0*lam
+    invM = inv1(M, EPS_M); invM2 = inv2(M, EPS_M)
+    # η_N ~ g * ( ... )
+    etaN = g * ( 0.1*invM + 0.02*invM2 - 0.05 )
+    beta_x = 2.0 + etaN
+    beta_l = (-2.0 + etaN)*lam + g*( 0.2*invM - 0.1 )
+    return beta_x, beta_l
+
+def beta_rhs_full(g, lam, tau, m2):
+    """
+    PLACEHOLDER! Replace with your actual full β's.
+    Return (β_x, β_λ, β_τ) with τ mixing and fixed m^2.
+    """
+    M, Delta = get_aux(g, lam, tau)
+    invM = inv1(M, EPS_M); invM2 = inv2(M, EPS_M)
+    invD = inv1(Delta, EPS_D); invD2 = inv2(Delta, EPS_D)
+
+    # Example η_N with τ-mixing (nonsense numbers):
+    etaN = g * ( 0.1*invM + 0.02*invM2 + 0.003*(g*tau)*invM2*invD - 0.05 )
+
+    # β_x = 2 + η_N
+    beta_x = 2.0 + etaN
+
+    # β_λ = (-2+η_N)λ + g * F(λ,τ; m2)
+    mix = ( 0.2*invM - 0.1 + 0.01*(g*tau)*invM2*invD + 0.002*invM2*invD2 )
+    beta_l = (-2.0 + etaN)*lam + g*mix
+
+    # β_τ: model a marginally relevant τ with small positive flow
+    beta_t = -0.01*tau + 0.001*g*invM2*invD
+
+    return beta_x, beta_l, beta_t
+
+def eta_N_piece(g, lam, tau, m2):
+    """Optional diagnostic; okay to leave as-is or mirror beta_rhs_full's η_N."""
+    M, Delta = get_aux(g, lam, tau)
+    invM = inv1(M, EPS_M); invM2 = inv2(M, EPS_M)
+    invD = inv1(Delta, EPS_D)
+    return g * ( 0.1*invM + 0.02*invM2 + 0.003*(g*tau)*invM2*invD - 0.05 )
+
+# ===========================================================
+# ============= End of MODEL REGION (paste over) ============
+# ===========================================================
+
+# -------------------------------
+# Residuals (scaled)
+# -------------------------------
+def residual_EH(v):
+    """Residuals for EH slice solve in (x, λ_t) with τ=0."""
+    x, lt = v
+    g = float(np.exp(x))
+    lam = float(lt * LAM_VAR)
+    bx, bl = beta_rhs_EH(g, lam)
+    return np.array([WX*bx, WL*bl], dtype=float)
+
+def residual_full(v, m2):
+    """Residuals for full solve in (x, λ_t, τ_t) with fixed m^2."""
+    x, lt, tt = v
     g = float(np.exp(x))
     lam = float(lt * LAM_VAR)
     tau = float(tt * TAU_VAR)
-    if not np.all(np.isfinite([g, lam, tau])): return (None, None, None)
-    return g, lam, tau
-
-def get_aux(g, lam, tau, m2_fixed):
-    """M = 1-2λ, Δ = 32π g τ - M/3; keep m2=m2_fixed for threshold functions."""
-    if g is None: return (None, None)
-    M = 1.0 - 2.0*lam
-    U = 32.0 * PI * g * tau
-    Delta = U - M/3.0
-    if not np.all(np.isfinite([M, Delta])): return (None, None)
-    return M, Delta
+    bx, bl, bt = beta_rhs_full(g, lam, tau, m2)
+    return np.array([WX*bx, WL*bl, WT*bt], dtype=float)
 
 # -------------------------------
-# Coefficients (placeholders → tuned to the projection used)
+# Newton wrappers
 # -------------------------------
-def get_A_coeffs(g, lam, tau, M, Delta):
-    invM, invM2 = inv1(M, EPS_M), inv2(M, EPS_M)
-    invD, invD2 = inv1(Delta, EPS_D), inv2(Delta, EPS_D)
-    A1 = -2*lam + (g/(2*PI))*(4*invM - 4 + 64*PI*g*tau*(invM2*invD) + (2/3.)*invM2 + 32*PI*g*tau*(invM2*invD2))
-    A2 =  lam - (g/(4*PI))*(4*invM + (2/3.)*invM2 + 32*PI*g*tau*(invM2*invD2))
-    return A1, A2
+def solve_EH(x0, lam0):
+    v0 = np.array([x0, lam0/LAM_VAR], dtype=float)
+    sol = least_squares(residual_EH, v0, method="trf",
+                        bounds=([-X_MAX, -200/LAM_VAR], [X_MAX, 200/LAM_VAR]),
+                        ftol=1e-12, xtol=1e-12, gtol=1e-12, max_nfev=10000)
+    return sol
 
-def get_B_coeffs(g, lam, tau, M, Delta):
-    invM, invM2 = inv1(M, EPS_M), inv2(M, EPS_M)
-    invD, invD2 = inv1(Delta, EPS_D), inv2(Delta, EPS_D)
-    B1 = (1.0/(4.0*PI))*(-5/6 - (25/36)*invM - (1/6)*(invM*invD) + (32/3.)*PI*g*tau*(invM*invD) + (16/3.)*PI*g*tau*(invM*invD2))
-    B2 = -(1.0/(8.0*PI))*((10/3.)*invM + (1/6.)*invM2 + (16/3.)*PI*g*tau*(invM*invD2))
-    return B1, B2
-
-def get_C_coeffs(g, lam, tau, M, Delta):
-    invM, invM2 = inv1(M, EPS_M), inv2(M, EPS_M)
-    invD, invD2 = inv1(Delta, EPS_D), inv2(Delta, EPS_D)
-    invM3 = invM*invM2; invMD = invM*invD
-    C1 = (1.0/(16.0*PI*PI))*(-13/360 + (3/4.)*invM - (1/90.)*invM3 - (23/60.)*invM2 + (1/18.)*invMD + (1/6.)*(M*invMD*invD2))
-    C2sum = (89/180.)*invM2 - 0.5*invMD - (1/6.)*(M*invMD*invD2) + (1/60.)*invM3
-    C2 = -(1.0/(32.0*PI*PI))*C2sum
-    return C1, C2
+def solve_full(x0, lam0, tau0, m2):
+    v0 = np.array([x0, lam0/LAM_VAR, tau0/TAU_VAR], dtype=float)
+    sol = least_squares(lambda u: residual_full(u, m2), v0, method="trf",
+                        bounds=([-X_MAX, -200/LAM_VAR, -2000/TAU_VAR],
+                                [ X_MAX,  200/LAM_VAR,  2000/TAU_VAR]),
+                        ftol=1e-12, xtol=1e-12, gtol=1e-12, max_nfev=20000)
+    return sol
 
 # -------------------------------
-# Beta functions (physical basis)
+# Continuation in τ
 # -------------------------------
-def beta_phys(x, lam, tau, m2_fixed):
-    g = float(np.exp(x))
-    M, Delta = get_aux(g, lam, tau, m2_fixed)
-    if M is None: return np.array([np.inf, np.inf, np.inf], float)
-    B1, B2 = get_B_coeffs(g, lam, tau, M, Delta)
-    denom = 1.0 - g*B2
-    if (not np.isfinite(denom)) or abs(denom) < 1e-12: return np.array([np.inf, np.inf, np.inf], float)
-    eta_N = (g*B1)/denom
-    A1, A2 = get_A_coeffs(g, lam, tau, M, Delta)
-    C1, C2 = get_C_coeffs(g, lam, tau, M, Delta)
-    beta_x   = 2.0 + eta_N
-    beta_lam = (eta_N - 2.0)*lam + (g/(8.0*PI))*(A1 + eta_N*A2)
-    beta_tau = 2.0*eta_N*tau + (g/(4.0*PI))*(C1 + eta_N*C2)
-    return np.array([beta_x, beta_lam, beta_tau], float)
+def continuation_tau(tau_max, m2, tol=1e-8, steps_max=60, seed_x=SEED_X, seed_l=SEED_L):
+    log(f">>> Continuation (adaptive): τ : 0 → {tau_max} (M2_FIXED={m2})")
+    # 1) EH slice
+    sol_eh = solve_EH(seed_x, seed_l)
+    if not sol_eh.success:
+        log("EH solve failed.")
+        return None
+    x_eh, lt_eh = sol_eh.x
+    g0 = float(np.exp(x_eh)); lam0 = float(lt_eh*LAM_VAR); tau0 = 0.0
 
-def beta_scaled(v, m2_fixed):
-    """Scaled residuals in solver variables (x, lam_t, tau_t)."""
-    g, lam, tau = to_phys(v)
-    if g is None: return np.array([1e6, 1e6, 1e6], float)
-    bx, bl, bt = beta_phys(np.log(g), lam, tau, m2_fixed)
-    # scale lambdas back to solver space
-    return np.array([WX*bx, WL*bl, WT*bt], float)
+    # 2) Ramp τ adaptively
+    tau = 0.0
+    x, lam = x_eh, lam0
+    steps = 0
+    while tau < tau_max and steps < steps_max:
+        steps += 1
+        # geometric-ish stepping with backoff
+        target = min(tau_max, tau + max(1e-6, 0.2*(tau + tau_max/80.0)))
+        sol = solve_full(x, lam, target, m2)
+        g, l, t = to_phys(sol.x)
+        r = residual_full(sol.x, m2)
+        rmax = float(np.max(np.abs(r / np.array([WX, WL, WT], dtype=float))))
+        log(f"  τ→{target:0.6f} : rmax={rmax:0.2e} | g={g:0.6f}, λ={l:0.6f}, τ={t:0.6f}")
+        if rmax > tol:
+            # backoff
+            if target - tau < 1e-8:
+                log("  (warning: step not tight and step size tiny; proceeding with best state)")
+                x, lam, tau = sol.x[0], sol.x[1]*LAM_VAR, sol.x[2]*TAU_VAR
+                break
+            tau = 0.5*(tau + target)
+            continue
+        # accept
+        x, lam, tau = sol.x[0], sol.x[1]*LAM_VAR, sol.x[2]*TAU_VAR
 
-def beta_clamped(v, tau_target, m2_fixed):
-    """Clamp τ to target for continuation (solve {β_x=0, β_λ=0, τ - τ_target = 0})."""
-    g, lam, tau = to_phys(v)
-    if g is None: return np.array([1e6, 1e6, 1e6], float)
-    bx, bl, _ = beta_phys(np.log(g), lam, tau, m2_fixed)
-    clamp = tau - tau_target
-    return np.array([WX*bx, WL*bl, WT*clamp], float)
-
-# -------------------------------
-# Solvers / utilities
-# -------------------------------
-def lsq(fun, x0):
-    lb = np.array([-X_MAX, -10.0/LAM_VAR, -10.0/TAU_VAR], float)
-    ub = np.array([ +X_MAX, +10.0/LAM_VAR, +10.0/TAU_VAR], float)
-    return least_squares(fun, x0, method="trf", bounds=(lb, ub),
-                         ftol=1e-12, xtol=1e-12, gtol=1e-12, max_nfev=4000)
-
-def print_state(t, rmax, v):
-    g, lam, tau = to_phys(v)
-    if g is None:
-        print(f"  τ→{t:.6f} : rmax={rmax:.2e} | invalid")
-    else:
-        print(f"  τ→{t:.6f} : rmax={rmax:.2e} | g={g:.6f}, λ={lam:.6f}, τ={tau:.6f}")
-
-def self_test_EH():
-    # sanity: EH slice equals τ=0 cut of full system
-    g, lam, tau = 1.0, 0.1, 0.0
-    bx1, bl1, bt1 = beta_phys(np.log(g), lam, tau, m2_fixed=5.0)
-    bx2, bl2, bt2 = bx1, bl1, bt1  # here EH = τ=0 slice of the same formulas
-    print("--- Running Self-Test for EH Limit (τ=0 slice) ---")
-    print(f"Δβ_λ (full@τ=0 minus EH) =  {bl1 - bl2: .2e}")
-    print("----------------------------------------")
+    return dict(x=x, lam=lam, tau=tau, m2=m2)
 
 # -------------------------------
-# Continuation in τ (adaptive)
+# Verification & stability
 # -------------------------------
-def adaptive_continuation(m2_fixed=5.0, tau_max=0.004, tol=1e-8, steps_max=60,
-                          seed_x=np.log(0.7), seed_lam=0.2):
-    print(f">>> Continuation (adaptive): τ : 0 → {tau_max} (M2_FIXED={m2_fixed}) ")
-    # seed at τ=0
-    v = np.array([seed_x, seed_lam/LAM_VAR, 0.0/TAU_VAR], float)
-    # try to lock onto the good branch quickly
-    ts = [tau_max/1000.0, tau_max/600.0, tau_max/450.0]
-    t, it = 0.0, 0
-    for s in ts:
-        it += 1
-        F = lambda z: beta_clamped(z, s, m2_fixed)
-        res = lsq(F, v)
-        r = F(res.x); rmax = float(np.max(np.abs(r)))
-        if rmax > 1e-2:
-            print("  (warning: stuck on a bad branch; restarting from EH seed)")
-            v = np.array([seed_x, seed_lam/LAM_VAR, 0.0/TAU_VAR], float)
-        else:
-            print_state(s, rmax, res.x)
-            v = res.x
-            t = s
+def verify_full(x, lam, tau, m2):
+    sol = solve_full(x, lam, tau, m2)
+    g, l, t = to_phys(sol.x)
+    bx, bl, bt = beta_rhs_full(g, l, t, m2)
+    log(">>> Verifying final point with full system …")
+    log("--- Verification ---")
+    log(f"  g*={g:.6f}, λ*={l:.6f}, τ*={t:.6f}")
+    log(f"  |β_x|={abs(bx):.2e}, |β_λ|={abs(bl):.2e}, |β_τ|={abs(bt):.2e}")
+    log(f"  (solver max|scaled β|={np.max(np.abs(residual_full(sol.x, m2))):.2e})")
+    return g, l, t
 
-    # adaptive to tau_max
-    n = 0
-    while t < tau_max and n < steps_max:
-        # propose step that shrinks as we approach target
-        dt = min( max( (tau_max - t)/6.0, tau_max/400.0 ), tau_max/20.0 )
-        t_next = min(t + dt, tau_max)
-        F = lambda z: beta_clamped(z, t_next, m2_fixed)
-        res = lsq(F, v)
-        r = F(res.x); rmax = float(np.max(np.abs(r)))
-        print_state(t_next, rmax, res.x)
-        v = res.x
-        t = t_next
-        n += 1
-
-    return v
-
-# -------------------------------
-# Jacobian and eigensystem
-# -------------------------------
-def jacobian_beta_phys(x, lam, tau, m2_fixed, hx=1e-6, hl=1e-6, ht=1e-6):
-    f0 = beta_phys(x, lam, tau, m2_fixed); J = np.zeros((3,3), float)
-    J[:,0] = (beta_phys(x+hx, lam, tau, m2_fixed) - beta_phys(x-hx, lam, tau, m2_fixed)) / (2*hx)
-    J[:,1] = (beta_phys(x, lam+hl, tau, m2_fixed) - beta_phys(x, lam-hl, tau, m2_fixed)) / (2*hl)
-    J[:,2] = (beta_phys(x, lam, tau+ht, m2_fixed) - beta_phys(x, lam, tau-ht, m2_fixed)) / (2*ht)
+def jacobian_numeric(g, lam, tau, m2, h=1e-8):
+    """Finite-difference Jacobian of (β_x,β_λ,β_τ) wrt (x,λ,τ) at given (g,λ,τ)."""
+    def F(x, l, t):
+        return np.array(beta_rhs_full(np.exp(x), l, t, m2), dtype=float)
+    x = math.log(max(g, EPS))
+    base = F(x, lam, tau)
+    J = np.zeros((3,3), dtype=float)
+    # x
+    J[:,0] = (F(x+h, lam, tau) - base)/h
+    # lam
+    J[:,1] = (F(x, lam+h, tau) - base)/h
+    # tau
+    J[:,2] = (F(x, lam, tau+h) - base)/h
     return J
 
-def map_evecs_to_gltau(evecs_xltau, g_star):
-    """Columns are eigenvectors in (x,λ,τ). Map to (g,λ,τ) via δg = g* δx and unit-normalize."""
-    M = np.diag([g_star, 1.0, 1.0])  # (x,λ,τ) → (g,λ,τ)
-    E = M @ evecs_xltau
-    # unit-norm columns
-    for j in range(E.shape[1]):
-        n = np.linalg.norm(E[:,j])
-        if n > 0: E[:,j] /= n
-    return E
-
-# -------------------------------
-# Main
-# -------------------------------
-def main():
-    args = parse_args()
-    m2 = float(args.m2)
-    self_test_EH()
-
-    # 1) continuation in τ with fixed m^2
-    v = adaptive_continuation(m2_fixed=m2, tau_max=args.tau_max, tol=args.tol, steps_max=args.steps_max,
-                              seed_x=args.seed_x, seed_lam=args.seed_lam)
-
-    # 2) verify final point against full system (unclamped)
-    res_final = lsq(lambda z: beta_scaled(z, m2), v)
-    # refine once more
-    res_final = lsq(lambda z: beta_scaled(z, m2), res_final.x)
-
-    g_star, lam_star, tau_star = to_phys(res_final.x)
-    bx, bl, bt = beta_phys(np.log(g_star), lam_star, tau_star, m2)
-
-    print(">>> Verifying final point with full system …")
-    print("--- Verification ---")
-    print(f"  g*={g_star:.6f}, λ*={lam_star:.6f}, τ*={tau_star:.6f}")
-    print(f"  |β_x|={abs(bx):.2e}, |β_λ|={abs(bl):.2e}, |β_τ|={abs(bt):.2e}")
-    r_scaled = beta_scaled(res_final.x, m2)
-    print(f"  (solver max|scaled β|={float(np.max(np.abs(r_scaled))):.2e})\n")
-
-    # 3) stability matrix and eigen-system at FP
-    J = jacobian_beta_phys(np.log(g_star), lam_star, tau_star, m2)
-    evals, evecs = np.linalg.eig(J)
-    thetas = -np.real(evals)
-
-    print("=== Stability (Jacobian at FP) ===")
-    print(f"g*={g_star:.6f}, λ*={lam_star:.6f}, τ*={tau_star:.6f}")
-    print("eig(J) =", np.real(evals))
-    print("θ (=-eig) =", thetas, "\n")
-
-    # map eigenvectors to (g,λ,τ)
-    E_gltau = map_evecs_to_gltau(evecs, g_star)
-    labels = ["g","λ","τ"]
+def dominant_component(vecs, labels=("g","λ","τ")):
     dom = []
-    print("--- Eigenvectors (columns) mapped to (g, λ, τ), unit-norm columns ---")
-    np.set_printoptions(precision=6, suppress=True)
-    print(E_gltau)
-    for j in range(E_gltau.shape[1]):
-        dom.append(labels[int(np.argmax(np.abs(E_gltau[:,j])) )])
-    print("\nDominant component per eigenvector:", dom)
+    for j in range(vecs.shape[1]):
+        col = vecs[:,j]
+        idx = int(np.argmax(np.abs(col)))
+        dom.append(labels[idx])
+    return dom
+
+# -------------------------------
+# CLI + main
+# -------------------------------
+def parse_args():
+    ap = argparse.ArgumentParser(description="FRG fixed-point solver (Option B: fixed m^2)")
+    ap.add_argument("--m2",       type=float, default=5.0,   help="Fixed m^2 (dimensionless)")
+    ap.add_argument("--tau-max",  type=float, default=0.004, help="Continuation target for τ")
+    ap.add_argument("--tol",      type=float, default=1e-8,  help="Max |scaled residual| per step")
+    ap.add_argument("--steps-max",type=int,   default=60,    help="Max continuation steps")
+    ap.add_argument("--seed-x",   type=float, default=SEED_X,help="EH seed for x=ln g")
+    ap.add_argument("--seed-lam", type=float, default=SEED_L,help="EH seed for λ")
+    ap.add_argument("--epsM",     type=float, default=EPS_M, help="Regulator ε_M on M denominators")
+    ap.add_argument("--epsD",     type=float, default=EPS_D, help="Regulator ε_Δ on Δ denominators")
+    ap.add_argument("--quiet", action="store_true",          help="Reduce continuation logging")
+    ap.add_argument("--no-evecs", action="store_true",       help="Skip eigenvector print")
+    return ap.parse_args()
+
+def main():
+    global EPS_M, EPS_D, log
+    args = parse_args()
+    EPS_M = args.epsM
+    EPS_D = args.epsD
+    if args.quiet:
+        def _quiet_log(*a, **k): pass
+        globals()['log'] = _quiet_log
+
+    # Continuation
+    state = continuation_tau(args.tau_max, args.m2, tol=args.tol,
+                             steps_max=args.steps_max,
+                             seed_x=args.seed_x, seed_l=args.seed_lam)
+    if not state:
+        print("Continuation failed.")
+        sys.exit(2)
+
+    # Verification
+    g, lam, tau = verify_full(state['x'], state['lam'], state['tau'], state['m2'])
+
+    # Stability
+    J = jacobian_numeric(g, lam, tau, args.m2)
+    evals, evecs = np.linalg.eig(J)
+    thetas = -evals
+
+    print("\n=== Stability (Jacobian at FP) ===")
+    print(f"g*={g:.6f}, λ*={lam:.6f}, τ*={tau:.6f}")
+    print(f"eig(J) = {np.array2string(evals, precision=8)}")
+    print(f"θ (=-eig) = {np.array2string(thetas, precision=8)} \n")
+
+    if not args.no_evecs:
+        # Map eigenvectors from (x,λ,τ) to (g,λ,τ):
+        #   δg = g * δx, δλ = δλ, δτ = δτ
+        G = np.diag([g, 1.0, 1.0])
+        vecs_phys = G @ evecs
+        # Normalize columns to unit norm for readability
+        for j in range(vecs_phys.shape[1]):
+            nj = norm(vecs_phys[:,j])
+            if nj > 0:
+                vecs_phys[:,j] /= nj
+        print("--- Eigenvectors (columns) mapped to (g, λ, τ), unit-norm columns ---")
+        with np.printoptions(precision=6, suppress=True):
+            print(vecs_phys)
+        print("\nDominant component per eigenvector:", dominant_component(vecs_phys))
+
+    # Repro footer
+    print("\n=== Reproducibility ===")
+    print(f"Python : {sys.version.split()[0]}")
+    print(f"NumPy  : {np.__version__}")
+    import scipy
+    print(f"SciPy  : {scipy.__version__}")
+    print(f"Tols   : least_squares ftol=xtol=gtol=1e-12; bounds x∈[-{X_MAX},{X_MAX}], λ_t∈[-200,200], τ_t∈[-2000,2000]")
+    print(f"Reg    : EPS_M={EPS_M}, EPS_D={EPS_D}, M2_FIXED={args.m2}")
+    print("Note   : Internal variable x=ln g ⇒ printed g=exp(x)")
 
 if __name__ == "__main__":
     main()
