@@ -100,16 +100,18 @@ def get_aux(g, lam, tau):
 #   m2 is fixed (Option B), can enter your kernels if needed
 # ===========================================================
 
-# ----- Tunable coefficients (keep small, stable defaults) -----
-_A0, _A1, _A2 = (-0.05, 0.10, 0.02)     # η_N EH: const, 1/M, 1/M^2
-_B0, _B1      = (-0.10, 0.20)           # β_λ EH: const, 1/M kernel (multiplied by g)
+# ----- Tunable coefficients (non-Gaussian demo) -----
+# Make η_N ≈ -20 g so that β_x = 2 + η_N = 2 - 20 g ⇒ g* ≈ 0.1
+_A0, _A1, _A2 = (-20.0, 0.0, 0.0)   # EH η_N: const term (times g)
+_B0, _B1      = (-0.05, 0.20)       # EH β_λ kernel (mild)
 
-# Full (τ-mixing) pieces:
-_C0, _C1, _C2 = (-0.05, 0.10, 0.02)     # η_N base: const, 1/M, 1/M^2
-_C3, _C4      = (0.003, 0.0)            # η_N τ-mix: (gτ)*1/M^2*1/Δ, and optional 1/Δ^2 term
-_D0, _D1      = (-0.10, 0.20)           # β_λ base kernel: const, 1/M
-_D2, _D3      = (0.010, 0.002)          # β_λ τ-mix: (gτ)*1/M^2*1/Δ, 1/M^2*1/Δ^2
-_E0, _E1      = (-0.010, 0.001)         # β_τ = E0*τ + E1*g*1/M^2*1/Δ
+# Full (τ-mixing) pieces: mirror EH and keep τ-mixing off for stability
+_C0, _C1, _C2 = (-20.0, 0.0, 0.0)   # full η_N base, matches EH
+_C3, _C4      = (0.0, 0.0)          # τ-mixing off for the demo
+_D0, _D1      = (-0.05, 0.20)       # full β_λ base kernel
+_D2, _D3      = (0.0, 0.0)          # τ-mixing off for the demo
+_E0, _E1      = (-0.010, 0.001)     # β_τ: gentle marginal behavior
+
 
 def _etaN_EH(g, lam):
     """
